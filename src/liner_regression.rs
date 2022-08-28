@@ -1,0 +1,106 @@
+use random::Source;
+use std::error::Error;
+use std::path::Path;
+use std::result::Result;
+use tensorflow::Code;
+use tensorflow::Graph;
+use tensorflow::SavedModelBundle;
+use tensorflow::SessionOptions;
+use tensorflow::SessionRunArgs;
+use tensorflow::Status;
+use tensorflow::Tensor;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let export_dir = "../example"; // y = w * x + b
+    if !Path::new(export_dir).exists() {
+        return Err(Box::new(
+            Status::new_set(
+                Code::NotFound,
+                &format!(
+                    "Run 'python regression_savedmodel.py' to generate \
+                     {} and try again.",
+                    export_dir
+                ),
+            )
+            .unwrap(),
+        ));
+    }
+
+    // いくつかのテストデータを作成
+    let w = 2.0;
+    let b = 0.3;
+    let num_points = 100;
+    let steps = 2001;
+    let mut rand = random::default();
+    let mut x = Tensor::new(&[num_points as u64]);
+    let mut y = Tensor::new(&[num_points as u64]);
+    for i in 0..num_points {
+        x[i] = (2.0 * rand.read::<f64>() - 1.0) as f32;
+        y[i] = w * x[i] + b;
+    }
+
+    // セーブモデルを読み込む
+    let mut graph = Graph::new();
+    let bundle =
+        SavedModelBundle::load(&SessionOptions::new(), &["serve"], &mut graph, export_dir)?;
+    let session = &bundle.session;
+
+    let train_signature = bundle.meta_graph_def().get_signature("train")?;
+    let x_info = train_signature.get_input("x")?;
+    let y_info = train_signature.get_input("y")?;
+    let train_info = train_signature.get_output("train")?;
+
+    let op_x = graph.operation_by_name_required(&x_info.name().name)?;
+    let op_y = graph.operation_by_name_required(&y_info.name().name)?;
+    let op_train = graph.operation_by_name_required(&train_info.name().name)?;
+    let w_info = bundle
+        .meta_graph_def()
+        .get_signature("w")?
+        .get_output("output")?;
+    let op_w = graph.operation_by_name_required(&w_info.name().name)?;
+    let b_info = bundle
+        .meta_graph_def()
+        .get_signature("b")?
+        .get_output("output")?;
+    let op_b = graph.operation_by_name_required(&b_info.name().name)?;
+
+    // モデルの訓練
+    let mut train_step = SessionRunArgs::new();
+    train_step.add_feed(&op_x, 0, &x);
+    train_step.add_feed(&op_y, 0, &y);
+    train_step.add_target(&op_train);
+    for _ in 0..steps {
+        session.run(&mut train_step)?;
+    }
+
+    // セッションからデータを取得
+    let mut output_step = SessionRunArgs::new();
+    let w_ix = output_step.request_fetch(&op_w, 0);
+    let b_ix = output_step.request_fetch(&op_b, 0);
+    session.run(&mut output_step)?;
+
+    // 結果を確認
+    let w_hat: f32 = output_step.fetch(w_ix)?[0];
+    let b_hat: f32 = output_step.fetch(b_ix)?[0];
+    println!(
+        "Checking w: expected {}, got {}. {}",
+        w,
+        w_hat,
+        if (w - w_hat).abs() < 1e-3 {
+            "Success!"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "Checking b: expected {}, got {}. {}",
+        b,
+        b_hat,
+        if (b - b_hat).abs() < 1e-3 {
+            "Success!"
+        } else {
+            "FAIL"
+        }
+    );
+    Ok(())
+}
